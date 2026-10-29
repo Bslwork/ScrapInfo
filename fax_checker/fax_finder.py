@@ -30,6 +30,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ----------------------------------------------------------------- settings
 INPUT_FILE = "Websites.xlsx"          # sheet with website URLs
 OUTPUT_FILE = "Fax_Results.xlsx"
+URL_COLUMN = None            # e.g. "Website" to force the column; None = auto-detect
+DETAIL_EXTRA_COLUMNS = []    # e.g. ["Name", "ID"]: copied into the "All Fax Locations" sheet
 
 MAX_PAGES_PER_SITE = 300     # safety cap: pages crawled per website (raise it for huge sites)
 MAX_SECONDS_PER_SITE = 420   # safety cap: max time spent on one website
@@ -38,7 +40,7 @@ MAX_WORKERS = 6              # websites processed in parallel
 REQUEST_TIMEOUT = 20
 RETRIES = 2
 DELAY_SECONDS = 0.3          # polite delay between pages of the same site
-USE_BROWSER_FALLBACK = True # True = 2nd pass with Playwright for rows still "Not found"
+USE_BROWSER_FALLBACK = False # True = 2nd pass with Playwright for rows still "Not found"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -425,12 +427,20 @@ def process_site(website, fetch, max_pages=None):
 
 # --------------------------------------------------------------------- main
 def pick_url_column(df):
-    for c in df.columns:
-        if re.search("website|url|link|site|web", str(c), re.I):
-            return c
+    if URL_COLUMN:
+        if URL_COLUMN not in df.columns:
+            raise SystemExit(f"URL_COLUMN {URL_COLUMN!r} not found. Columns: {list(df.columns)}")
+        return URL_COLUMN
+
+    def looks_like_url(v):
+        v = str(v).strip()
+        return bool(v) and " " not in v and bool(re.search(r"^(https?://|www\.)|\.[a-z]{2,}(/|$)", v, re.I))
+
     def score(c):
-        return sum(bool(re.search(r"\.[a-z]{2,}", str(v), re.I)) and " " not in str(v).strip()
-                   for v in df[c])
+        share = sum(looks_like_url(v) for v in df[c]) / max(len(df), 1)
+        bonus = 0.5 if re.search("website|url|link|web|site", str(c), re.I) else 0
+        return share + bonus * (share > 0.3)       # header only counts if the values look like URLs
+
     return max(df.columns, key=score)
 
 
@@ -480,10 +490,15 @@ def main():
                 browser.close()
 
     res = pd.DataFrame([results[clean_url(v)] for v in df[url_col]]).reindex(columns=COLUMNS).fillna("")
-    out = pd.concat([df.reset_index(drop=True), res], axis=1)
+    orig = df.reset_index(drop=True).copy()
+    orig.columns = [f"{c} (input)" if c in COLUMNS else c for c in orig.columns]   # avoid name clashes
+    out = pd.concat([orig, res], axis=1)                  # every original column is kept, in order
 
-    detail_rows = [{"Website": u, **d} for u, r in results.items() for d in r.get("_details", [])]
-    detail_cols = ["Website", "Fax Number", "Fax score", "Phone score",
+    extra = [c for c in DETAIL_EXTRA_COLUMNS if c in df.columns]
+    first_row = {clean_url(r[url_col]): r for _, r in df.iloc[::-1].iterrows()}   # first row per website
+    detail_rows = [{"Website": u, **{c: first_row[u][c] for c in extra}, **d}
+                   for u, r in results.items() for d in r.get("_details", [])]
+    detail_cols = ["Website", *extra, "Fax Number", "Fax score", "Phone score",
                    "Pages with this fax", "Page URL", "Evidence"]
     with pd.ExcelWriter(OUTPUT_FILE) as xw:
         out.to_excel(xw, sheet_name="Results", index=False)
