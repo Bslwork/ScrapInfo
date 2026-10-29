@@ -1,9 +1,10 @@
 """
-Fax number finder (v3)
+Fax number + email finder (v4)
 
 The input sheet only needs website URLs. For every website the script crawls the
-likely pages (contact, locations, about, sitemap...) and extracts the FAX number
-by reading the label that sits next to each phone-style number. It crawls EVERY
+likely pages (contact, locations, about, sitemap...) and extracts
+  * EMAIL addresses, ranked by priority (same-domain, contact-type addresses first)
+  * FAX numbers, by reading the label that sits next to each phone-style number. It crawls EVERY
 internal page it can reach (not just the first hit), so faxes that appear on other
 pages/locations are collected too.
 
@@ -18,7 +19,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -31,7 +32,22 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 INPUT_FILE = "Websites.xlsx"          # sheet with website URLs
 OUTPUT_FILE = "Fax_Results.xlsx"
 URL_COLUMN = None            # e.g. "Website" to force the column; None = auto-detect
-DETAIL_EXTRA_COLUMNS = []    # e.g. ["Name", "ID"]: copied into the "All Fax Locations" sheet
+DETAIL_EXTRA_COLUMNS = []    # e.g. ["Name", "ID"]: copied into the "All Fax Locations"/"All Emails" sheets
+
+# Duplicate removal (applied to all three sheets before saving)
+REMOVE_DUPLICATES = True
+DEDUPE_BY = ["Email", "Fax Number"]   # Results sheet: rows with the same values in ALL these columns are merged
+                                      # (use ["Email"] or ["Fax Number"] to merge on just one)
+
+# Email priority: the best-ranked address becomes the "Email" column. Edit freely.
+# An address on the same domain as the website always beats third-party addresses.
+EMAIL_PRIORITY_PREFIXES = ["contact", "info", "hello", "office", "admin", "inquiries", "inquiry",
+                           "general", "mail", "frontdesk", "reception", "service", "customerservice"]
+EMAIL_SECONDARY_PREFIXES = ["appointments", "appointment", "referrals", "referral", "records",
+                            "medicalrecords", "billing", "support", "sales", "help", "scheduling",
+                            "intake", "enquiries", "team", "hr"]
+EMAIL_AVOID_PREFIXES = ["noreply", "donotreply", "unsubscribe", "privacy", "webmaster", "abuse",
+                        "postmaster", "mailer", "bounce", "notifications", "newsletter"]
 
 MAX_PAGES_PER_SITE = 300     # safety cap: pages crawled per website (raise it for huge sites)
 MAX_SECONDS_PER_SITE = 420   # safety cap: max time spent on one website
@@ -205,6 +221,8 @@ def _walk_json(node, out):
                 out.append(("Phone", str(v)))
             elif kl in ("faxnumber", "fax") and isinstance(v, (str, int)):
                 out.append(("Fax", str(v)))
+            elif kl == "email" and isinstance(v, str):
+                out.append(("Email", v))
             else:
                 _walk_json(v, out)
     elif isinstance(node, list):
@@ -216,8 +234,64 @@ def host_key(url):
     return urlparse(url).netloc.lower().removeprefix("www.")
 
 
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,}")
+OBF_RE = re.compile(
+    r"([A-Za-z0-9._%+\-]+)\s*[\[\(\{]\s*at\s*[\]\)\}]\s*"
+    r"((?:[A-Za-z0-9\-]+\s*(?:\.|[\[\(\{]\s*dot\s*[\]\)\}])\s*)+[A-Za-z]{2,})", re.I)
+BAD_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js", "ico", "woff", "woff2", "ttf", "pdf", "mp4"}
+BAD_DOMAINS = ("example.com", "domain.com", "yourdomain.com", "email.com", "test.com",
+               "sentry.io", "wixpress.com")
+
+
+def clean_email(e):
+    e = unquote(str(e)).strip().strip(".,;:<>()[]{}'\"").lower()
+    if e.count("@") != 1 or ".." in e or len(e) > 100 or not EMAIL_RE.fullmatch(e):
+        return ""
+    dom = e.split("@")[1]
+    if dom.rsplit(".", 1)[1] in BAD_TLDS or any(dom == b or dom.endswith("." + b) for b in BAD_DOMAINS):
+        return ""
+    return e
+
+
+def decode_cfemail(h):
+    """Decode Cloudflare 'email protection' hex strings."""
+    try:
+        key = int(h[:2], 16)
+        return "".join(chr(int(h[i:i + 2], 16) ^ key) for i in range(2, len(h), 2))
+    except Exception:
+        return ""
+
+
+def site_domain(website):
+    parts = host_key(website).split(".")
+    if len(parts) >= 3 and parts[-2] in ("co", "com", "org", "net", "gov", "edu", "ac") and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _prefix_match(lp, prefixes):
+    return any(lp == p or (len(p) >= 5 and lp.startswith(p)) for p in prefixes)
+
+
+def email_score(email, info, sdom):
+    local, dom = email.split("@")
+    lp = re.sub(r"[^a-z0-9]", "", local)
+    same = dom == sdom or dom.endswith("." + sdom)
+    score = info["w"] + min(len(info["pages"]), 3)       # mailto/protected link > plain text; repeated
+    score += 5 if same else 0                            # belongs to the website's own domain
+    if _prefix_match(lp, EMAIL_PRIORITY_PREFIXES):
+        score += 4
+    elif _prefix_match(lp, EMAIL_SECONDARY_PREFIXES):
+        score += 2
+    if _prefix_match(lp, EMAIL_AVOID_PREFIXES):
+        score -= 8
+    if any("contact" in u.lower() for u in info["pages"]):
+        score += 2
+    return score, same
+
+
 def parse_page(html, url):
-    """Return (visible_text, raw_text, links[(score, url)])."""
+    """Return (visible_text, raw_text, links[(score, url)], {email: weight})."""
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
@@ -233,6 +307,22 @@ def parse_page(html, url):
         except Exception:
             pass
 
+    emails = {}
+
+    def add_email(e, w):
+        e = clean_email(e)
+        if e:
+            emails[e] = max(emails.get(e, 0), w)
+
+    for el in soup.find_all(attrs={"data-cfemail": True}):      # Cloudflare-protected emails
+        dec = decode_cfemail(str(el.get("data-cfemail")))
+        add_email(dec, 3)
+        if dec:
+            try:
+                el.string = dec
+            except Exception:
+                pass
+
     # 2) microdata + tel:/fax: links -> make the label visible in the text
     for el in soup.find_all(attrs={"itemprop": True}):
         ip = str(el.get("itemprop")).lower()
@@ -243,7 +333,12 @@ def parse_page(html, url):
     for a in soup.find_all("a", href=True):
         h = a["href"].strip()
         low = h.lower()
-        if low.startswith(("tel:", "callto:")):
+        if low.startswith("mailto:"):
+            for part in re.split(r"[,;]", unquote(h[7:]).split("?")[0]):
+                add_email(part, 3)
+        elif "email-protection#" in low:
+            add_email(decode_cfemail(h.split("#", 1)[1]), 3)
+        elif low.startswith(("tel:", "callto:")):
             num = h.split(":", 1)[1]
             if normalize_phone(num) not in normalize_phone(a.get_text()):
                 a.append(soup.new_string(f" {num} "))
@@ -270,8 +365,13 @@ def parse_page(html, url):
     raw = re.sub(r"<[^>]+>", " ", htmllib.unescape(html))   # also catches scripts/attributes
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
-    text = soup.get_text(" ", strip=True) + " " + " ".join(synthetic)
-    return re.sub(r"\s+", " ", text), re.sub(r"\s+", " ", raw), links
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True) + " " + " ".join(synthetic))
+    for m in EMAIL_RE.finditer(text):
+        add_email(m.group(), 1)
+    for m in OBF_RE.finditer(text):                              # "name [at] site [dot] com"
+        dom = re.sub(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", ".", m.group(2))
+        add_email(m.group(1) + "@" + re.sub(r"\s+", "", dom), 1)
+    return text, re.sub(r"\s+", " ", raw), links, emails
 
 
 def sitemap_urls(site_root, fetch, limit=500):
@@ -325,6 +425,7 @@ def process_site(website, fetch, max_pages=None):
     """Crawl every reachable internal page and collect ALL numbers labeled Fax."""
     max_pages = max_pages or MAX_PAGES_PER_SITE
     cands = {}      # digits -> {"fax","phone","ev": {page_url: snippet}, "pages": set()}
+    emails = {}     # email -> {"w": best source weight, "pages": set()}
     heap, queued, counter = [], set(), 0
     crawled, ok_pages, err, seeded = 0, 0, "", False
     started = time.time()
@@ -364,7 +465,7 @@ def process_site(website, fetch, max_pages=None):
         crawled += 1
         try:
             html, final_url = fetch(url)
-            text, raw, links = parse_page(html, final_url)   # final_url keeps redirects/www correct
+            text, raw, links, page_emails = parse_page(html, final_url)   # final_url keeps redirects/www correct
             ok_pages += 1
         except Exception as exc:
             if not err and ok_pages == 0:      # only report if nothing has loaded (guessed paths 404 normally)
@@ -387,6 +488,10 @@ def process_site(website, fetch, max_pages=None):
         for score, link in links:
             push(score, link)
 
+        for e, w in page_emails.items():
+            info = emails.setdefault(e, {"w": 0, "pages": set()})
+            info["w"] = max(info["w"], w)
+            info["pages"].add(url)
         record(text, url)
         record(raw, url, only_fax=True)        # numbers hidden in scripts/attributes
         time.sleep(DELAY_SECONDS)              # NOTE: no early stop - every page is read
@@ -398,17 +503,41 @@ def process_site(website, fetch, max_pages=None):
     out = {"Pages checked": crawled, "Pages loaded": ok_pages, "Error": err if not ok_pages else "",
            "Crawl complete": "Yes" if not heap else f"No (cap reached, {len(heap)} pages left)",
            "Phone Numbers (reference)": ", ".join(pretty(d) for d in phones[:4]),
-           "_details": []}
+           "_details": [], "_email_details": []}
+
+    sdom = site_domain(website)
+    ranked = sorted(((e, i, *email_score(e, i, sdom)) for e, i in emails.items()),
+                    key=lambda x: (-x[2], x[0]))          # (email, info, score, same)
+    if ranked:
+        e, i, sc, same = ranked[0]
+        out.update({
+            "Email": e, "Email Status": "Email found", "Email Count": len(ranked),
+            "Email Confidence": "High" if same and sc >= 10 else "Medium" if same else "Low (other domain)",
+            "Other Emails": "; ".join(f"{x[0]} [{len(x[1]['pages'])} page(s)]" for x in ranked[1:10]),
+            "Email Found On": " | ".join(sorted(i["pages"], key=lambda u: "contact" not in u.lower())[:3]) +
+                              (f" (+{len(i['pages']) - 3} more)" if len(i["pages"]) > 3 else ""),
+        })
+        for rank, (e, i, sc, same) in enumerate(ranked, 1):
+            out["_email_details"].append({
+                "Email": e, "Priority rank": rank, "Score": sc,
+                "Same domain as website": "Yes" if same else "No",
+                "Pages with this email": len(i["pages"]),
+                "Example page URLs": " | ".join(sorted(i["pages"], key=lambda u: "contact" not in u.lower())[:5])})
+    elif ok_pages == 0:
+        out["Email Status"] = "Website unreachable"
+    else:
+        out["Email Status"] = "No email listed on website"
+
     if faxes:
         d, c = faxes[0]
         conf = ("High" if c["fax"] >= 5 and c["phone"] == 0
                 else "Medium" if c["fax"] > c["phone"] else "Low (shared phone/fax line)")
         out.update({
-            "Fax Number": pretty(d), "Fax Confidence": conf, "Status": "Fax found",
+            "Fax Number": pretty(d), "Fax Confidence": conf, "Fax Status": "Fax found",
             "Fax Count": len(faxes),
             "Other Fax Numbers": "; ".join(f"{pretty(x)} [{len(y['pages'])} page(s)]"
                                            for x, y in faxes[1:10]),
-            "Evidence": " || ".join(list(c["ev"].values())[:2])[:1000],
+            "Fax Evidence": " || ".join(list(c["ev"].values())[:2])[:1000],
             "Fax Found On": " | ".join(sorted(c["pages"])[:3]) +
                             (f" (+{len(c['pages']) - 3} more)" if len(c["pages"]) > 3 else ""),
         })
@@ -416,12 +545,12 @@ def process_site(website, fetch, max_pages=None):
             for page, snip in c["ev"].items():
                 out["_details"].append({
                     "Fax Number": pretty(d), "Fax score": c["fax"], "Phone score": c["phone"],
-                    "Pages with this fax": len(c["pages"]), "Page URL": page, "Evidence": snip})
+                    "Pages with this fax": len(c["pages"]), "Page URL": page, "Fax Evidence": snip})
     elif ok_pages == 0:
-        out.update({"Status": "Website unreachable", "Evidence": "Could not load any page."})
+        out.update({"Fax Status": "Website unreachable", "Fax Evidence": "Could not load any page."})
     else:
-        out.update({"Status": "No fax listed on website",
-                    "Evidence": f"No number labeled Fax in {ok_pages} loaded page(s)."})
+        out.update({"Fax Status": "No fax listed on website",
+                    "Fax Evidence": f"No number labeled Fax in {ok_pages} loaded page(s)."})
     return out
 
 
@@ -444,20 +573,95 @@ def pick_url_column(df):
     return max(df.columns, key=score)
 
 
-COLUMNS = ["Fax Number", "Fax Confidence", "Status", "Fax Count", "Other Fax Numbers",
-           "Phone Numbers (reference)", "Evidence", "Fax Found On",
+COLUMNS = ["Email", "Email Confidence", "Email Status", "Email Count", "Other Emails", "Email Found On",
+           "Fax Number", "Fax Confidence", "Fax Status", "Fax Count", "Other Fax Numbers",
+           "Phone Numbers (reference)", "Fax Evidence", "Fax Found On",
            "Pages checked", "Pages loaded", "Crawl complete", "Error"]
 RETRY = {"No fax listed on website", "Website unreachable"}
+EMAIL_RETRY = {"No email listed on website", "Website unreachable"}
+FAX_KEYS = ["Fax Number", "Fax Confidence", "Fax Status", "Fax Count", "Other Fax Numbers",
+            "Fax Evidence", "Fax Found On", "_details"]
+EMAIL_KEYS = ["Email", "Email Confidence", "Email Status", "Email Count", "Other Emails",
+              "Email Found On", "_email_details"]
+
+
+def merge_results(old, new):
+    """Browser pass: take fax/email groups from the new result only where the old one found nothing."""
+    out = dict(old)
+    for keys, flag, found in ((FAX_KEYS, "Fax Status", "Fax found"), (EMAIL_KEYS, "Email Status", "Email found")):
+        if new.get(flag) == found and old.get(flag) != found:
+            for k in keys:
+                out[k] = new.get(k, [] if k.startswith("_") else "")
+    return out
 
 
 def run_site(website_raw, fetch, max_pages=None):
     website = clean_url(website_raw)
     if not website:
-        return {"Status": "Invalid/missing URL", "_details": []}
+        return {"Fax Status": "Invalid/missing URL", "Email Status": "Invalid/missing URL",
+                "_details": [], "_email_details": []}
     try:
         return process_site(website, fetch, max_pages)
     except Exception as exc:
-        return {"Status": "Error", "Error": f"{type(exc).__name__}: {exc}", "_details": []}
+        return {"Fax Status": "Error", "Email Status": "Error",
+                "Error": f"{type(exc).__name__}: {exc}", "_details": [], "_email_details": []}
+
+
+# ------------------------------------------------------------- duplicate removal
+def norm_key(col, value):
+    """Comparable form of a value: faxes -> digits only, everything else -> lower-case text."""
+    v = str(value or "").strip().lower()
+    return re.sub(r"\D", "", v) if "fax" in col.lower() else v
+
+
+def _more(sites, kept_site, limit=5):
+    others = [w for w in dict.fromkeys(sites) if w and w != kept_site]
+    return " | ".join(others[:limit]) + (f" (+{len(others) - limit} more)" if len(others) > limit else "")
+
+
+def dedupe_results(out, url_col):
+    """
+    Keep ONE row per distinct (Email, Fax Number) pair. Lookup dict `seen` maps each key to the
+    row that was kept; later rows with the same key are dropped (entire row).
+    Rows with neither an email nor a fax are never merged with other websites' empty rows,
+    only with repeats of the same website.
+    """
+    cols = [c for c in DEDUPE_BY if c in out.columns]
+    seen, keep, removed, dup_sites = {}, [], {}, {}
+    for idx, row in out.iterrows():
+        vals = tuple(norm_key(c, row[c]) for c in cols)
+        key = ("data", vals) if any(vals) else ("site", clean_url(row[url_col]).lower().rstrip("/"))
+        if key in seen:
+            k = seen[key]
+            removed[k] = removed.get(k, 0) + 1
+            dup_sites.setdefault(k, []).append(clean_url(row[url_col]))
+        else:
+            seen[key] = idx
+            keep.append(idx)
+    res = out.loc[keep].copy()
+    res["Duplicates removed"] = [removed.get(i, 0) for i in res.index]
+    res["Duplicate websites"] = [_more(dup_sites.get(i, []), clean_url(res.at[i, url_col])) for i in res.index]
+    return res.reset_index(drop=True), len(out) - len(res)
+
+
+def dedupe_details(df, key_col, best_col):
+    """One row per distinct value of key_col (across ALL websites); keeps the row with the highest best_col."""
+    if df.empty:
+        return df, 0
+    d = df.reset_index(drop=True).copy()
+    d["_order"] = range(len(d))
+    d["_k"] = d[key_col].map(lambda v: norm_key(key_col, v))
+    d["_best"] = pd.to_numeric(d[best_col], errors="coerce").fillna(0)
+    d = d.sort_values("_best", ascending=False, kind="stable")          # best row first within each key
+    rows = []
+    for _, g in d.groupby("_k", sort=False):
+        best = g.iloc[0].copy()
+        best["Duplicates removed"] = len(g) - 1
+        best["Also found on websites"] = _more(list(g.iloc[1:]["Website"]), best["Website"])
+        best["_order"] = g["_order"].min()                              # keep original ordering
+        rows.append(best)
+    res = pd.DataFrame(rows).sort_values("_order").drop(columns=["_k", "_best", "_order"])
+    return res.reset_index(drop=True), len(df) - len(res)
 
 
 def main():
@@ -472,20 +676,22 @@ def main():
         for n, fut in enumerate(as_completed(futs), 1):
             u = futs[fut]
             r = results[u] = fut.result()
-            print(f"{n}/{len(unique)}: {u} -> {r.get('Fax Number') or r['Status']} "
-                  f"({r.get('Fax Count', 0)} fax, {r.get('Pages checked', 0)} pages)")
+            print(f"{n}/{len(unique)}: {u} -> email: {r.get('Email') or r['Email Status']} | "
+                  f"fax: {r.get('Fax Number') or r['Fax Status']} "
+                  f"({r.get('Email Count', 0)} emails, {r.get('Fax Count', 0)} faxes, {r.get('Pages checked', 0)} pages)")
 
     if USE_BROWSER_FALLBACK:
-        todo = [u for u, r in results.items() if u and r.get("Status") in RETRY]
+        todo = [u for u, r in results.items()
+                if u and (r.get("Fax Status") in RETRY or r.get("Email Status") in EMAIL_RETRY)]
         if todo:
             print(f"\nBrowser pass for {len(todo)} sites...")
             browser = BrowserFetcher()
             try:
                 for n, u in enumerate(todo, 1):
                     r = run_site(u, browser, BROWSER_MAX_PAGES)
-                    if r.get("Status") == "Fax found":
-                        results[u] = r
-                    print(f"  {n}/{len(todo)}: {u} -> {r.get('Fax Number') or r['Status']}")
+                    results[u] = merge_results(results[u], r)
+                    print(f"  {n}/{len(todo)}: {u} -> email: {r.get('Email') or r['Email Status']} | "
+                          f"fax: {r.get('Fax Number') or r['Fax Status']}")
             finally:
                 browser.close()
 
@@ -496,14 +702,28 @@ def main():
 
     extra = [c for c in DETAIL_EXTRA_COLUMNS if c in df.columns]
     first_row = {clean_url(r[url_col]): r for _, r in df.iloc[::-1].iterrows()}   # first row per website
-    detail_rows = [{"Website": u, **{c: first_row[u][c] for c in extra}, **d}
-                   for u, r in results.items() for d in r.get("_details", [])]
-    detail_cols = ["Website", *extra, "Fax Number", "Fax score", "Phone score",
-                   "Pages with this fax", "Page URL", "Evidence"]
+
+    def make_details(key, cols):
+        rows = [{"Website": u, **{c: first_row[u][c] for c in extra}, **d}
+                for u, r in results.items() for d in r.get(key, [])]
+        return pd.DataFrame(rows, columns=["Website", *extra, *cols])
+
+    emails_df = make_details("_email_details", ["Email", "Priority rank", "Score", "Same domain as website",
+                                                "Pages with this email", "Example page URLs"])
+    faxes_df = make_details("_details", ["Fax Number", "Fax score", "Phone score", "Pages with this fax",
+                                         "Page URL", "Fax Evidence"])
+    if REMOVE_DUPLICATES:
+        out, n1 = dedupe_results(out, url_col)
+        emails_df, n2 = dedupe_details(emails_df, "Email", "Score")
+        faxes_df, n3 = dedupe_details(faxes_df, "Fax Number", "Fax score")
+        print(f"\nDuplicates removed -> Results: {n1} | All Emails: {n2} | All Fax Locations: {n3}")
+
     with pd.ExcelWriter(OUTPUT_FILE) as xw:
         out.to_excel(xw, sheet_name="Results", index=False)
-        pd.DataFrame(detail_rows, columns=detail_cols).to_excel(xw, sheet_name="All Fax Locations", index=False)
-    print("\nSummary:\n", out["Status"].value_counts().to_string())
+        emails_df.to_excel(xw, sheet_name="All Emails", index=False)
+        faxes_df.to_excel(xw, sheet_name="All Fax Locations", index=False)
+    print("\nEmail status:\n", out["Email Status"].value_counts().to_string())
+    print("\nFax status:\n", out["Fax Status"].value_counts().to_string())
     print(f"\nFinished. Results saved to: {OUTPUT_FILE}")
 
 
